@@ -164,6 +164,18 @@ inline uint8_t float_to_fp8e5m2_scalar(float v, float inv_scale) noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// per-tensor int8 quant: q = round(clamp(v * inv_scale, -127, 127)).
+// Returned as a byte (the cache buffer is reinterpreted to uint8 for writes);
+// on read it is reinterpreted back to int8_t and sign-extended to float.
+// ---------------------------------------------------------------------------
+inline uint8_t float_to_int8_scalar(float v, float inv_scale) noexcept {
+  v *= inv_scale;
+  v = std::nearbyint(v);
+  v = std::max(-127.0f, std::min(127.0f, v));
+  return static_cast<uint8_t>(static_cast<int8_t>(v));
+}
+
+// ---------------------------------------------------------------------------
 // Select the FP8 quant function at compile time based on kv_cache_t.
 // ---------------------------------------------------------------------------
 template <typename kv_cache_t>
@@ -175,13 +187,14 @@ constexpr auto select_fp8_quant_fn() {
 }
 
 // ---------------------------------------------------------------------------
-// VEC reshape impl — parameterised on the quantisation function.
-// Writes key (column-major) and value (row-major) into uint8 FP8 KV cache.
+// VEC reshape impl — parameterised on the quantisation function (fp8 or int8).
+// Writes key (column-major) and value (row-major) into the byte KV cache
+// buffer (uint8-backed storage shared by the fp8 and int8 paths).
 // The pragma omp must live outside VLLM_DISPATCH_FLOATING_TYPES because
 // #pragma cannot appear inside variadic macro arguments.
 // ---------------------------------------------------------------------------
 template <typename scalar_t, uint8_t (*quant_fn)(float, float)>
-inline void reshape_and_cache_fp8_vec_impl(
+inline void reshape_and_cache_quant_vec_impl(
     const scalar_t* key_ptr, const scalar_t* value_ptr, uint8_t* key_cache_ptr,
     uint8_t* value_cache_ptr, const int64_t* slot_ptr, int64_t token_num,
     int64_t head_num, int64_t head_dim, int64_t block_size, int64_t k_stride0,

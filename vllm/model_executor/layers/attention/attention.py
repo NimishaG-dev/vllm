@@ -579,9 +579,13 @@ class Attention(nn.Module, AttentionLayerBase):
         return output.view(-1, hidden_size)
 
     def calc_kv_scales(self, query, key, value):
+        # per-tensor int8 KV cache quantizes to the int8 dynamic range
+        # (|max|/127), not the default fp8-oriented *_SCALE_CONSTANT ranges.
+        k_range = 127.0 if self.kv_cache_dtype == "int8" else self.k_range
+        v_range = 127.0 if self.kv_cache_dtype == "int8" else self.v_range
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
-        self._k_scale.copy_(torch.abs(key).max() / self.k_range)
-        self._v_scale.copy_(torch.abs(value).max() / self.v_range)
+        self._k_scale.copy_(torch.abs(key).max() / k_range)
+        self._v_scale.copy_(torch.abs(value).max() / v_range)
         self._q_scale_float = self._q_scale.item()
         self._k_scale_float = self._k_scale.item()
         self._v_scale_float = self._v_scale.item()
@@ -701,6 +705,15 @@ def maybe_calc_kv_scales(
     # Only calculate if the layer's calculate_kv_scales flag is True
     # This flag gets set to False after the first forward pass
     if not self.calculate_kv_scales:
+        return
+
+    # do NOT calibrate KV scales on profiling/dummy runs. Those runs
+    # have attn_metadata=None (and slot_mapping=-1, so no KV is written) and
+    # their synthetic activations are unrepresentative of real data. For int8
+    # KV cache (no exponent, hard clamp at +/-127) a scale calibrated on the
+    # dummy run is far too small -> real K/V saturate -> garbage. Defer the
+    # one-shot calibration to the first *real* forward pass instead.
+    if forward_context.attn_metadata is None:
         return
 
     self.calc_kv_scales(query, key, value)

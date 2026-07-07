@@ -1,14 +1,17 @@
 #include "cpu_attn_dispatch_generated.h"
 
-// Maps kv_cache_dtype string to Fp8KVCacheDataType enum.
+// Maps kv_cache_dtype string to QuantKVCacheDataType enum.
 // "auto" -> kAuto(0); "fp8"/"fp8_e4m3" -> kFp8E4M3; "fp8_e5m2" -> kFp8E5M2.
-static inline cpu_attention::Fp8KVCacheDataType parse_fp8_kv_dtype(
+// "int8" -> kInt8 (per-tensor int8 KV cache).
+static inline cpu_attention::QuantKVCacheDataType parse_quant_kv_dtype(
     const std::string& kv_cache_dtype) {
   if (kv_cache_dtype == "fp8_e5m2")
-    return cpu_attention::Fp8KVCacheDataType::kFp8E5M2;
+    return cpu_attention::QuantKVCacheDataType::kFp8E5M2;
   if (kv_cache_dtype == "fp8_e4m3" || kv_cache_dtype == "fp8")
-    return cpu_attention::Fp8KVCacheDataType::kFp8E4M3;
-  return cpu_attention::Fp8KVCacheDataType::kAuto;
+    return cpu_attention::QuantKVCacheDataType::kFp8E4M3;
+  if (kv_cache_dtype == "int8")
+    return cpu_attention::QuantKVCacheDataType::kInt8;
+  return cpu_attention::QuantKVCacheDataType::kAuto;
 }
 
 bool cpu_attn_has_isa(const std::string& isa) {
@@ -100,20 +103,26 @@ void cpu_attn_reshape_and_cache(
   TORCH_CHECK_EQ(value.stride(2), 1);
 
   const int64_t kv_cache_idx =
-      static_cast<int64_t>(parse_fp8_kv_dtype(kv_cache_dtype));
-  const bool is_fp8 = (kv_cache_idx != 0);
+      static_cast<int64_t>(parse_quant_kv_dtype(kv_cache_dtype));
+  // is_quant covers fp8 and int8; is_int8 picks the int8 storage type.
+  const bool is_quant = (kv_cache_idx != 0);
+  const bool is_int8 =
+      kv_cache_idx ==
+      static_cast<int64_t>(cpu_attention::QuantKVCacheDataType::kInt8);
 
-  if (is_fp8) {
-    TORCH_CHECK(key_cache.scalar_type() == at::ScalarType::Byte,
-                "key_cache must be uint8 for FP8 path");
-    TORCH_CHECK(value_cache.scalar_type() == at::ScalarType::Byte,
-                "value_cache must be uint8 for FP8 path");
-    TORCH_CHECK(k_scale > 0, "k_scale must be positive for FP8 path");
-    TORCH_CHECK(v_scale > 0, "v_scale must be positive for FP8 path");
+  if (is_quant) {
+    const auto expected_dtype =
+        is_int8 ? at::ScalarType::Char : at::ScalarType::Byte;
+    TORCH_CHECK(key_cache.scalar_type() == expected_dtype,
+                "quantized KV cache: key_cache has unexpected scalar type");
+    TORCH_CHECK(value_cache.scalar_type() == expected_dtype,
+                "quantized KV cache: value_cache has unexpected scalar type");
+    TORCH_CHECK(k_scale > 0, "k_scale must be positive for quantized KV cache");
+    TORCH_CHECK(v_scale > 0, "v_scale must be positive for quantized KV cache");
   }
 
-  const float k_inv = is_fp8 ? 1.0f / static_cast<float>(k_scale) : 0.0f;
-  const float v_inv = is_fp8 ? 1.0f / static_cast<float>(v_scale) : 0.0f;
+  const float k_inv = is_quant ? 1.0f / static_cast<float>(k_scale) : 0.0f;
+  const float v_inv = is_quant ? 1.0f / static_cast<float>(v_scale) : 0.0f;
 
   const int64_t token_num = key.size(0);
   const int64_t head_num = key.size(1);
@@ -144,10 +153,10 @@ void cpu_attn_reshape_and_cache(
     }
   }();
 
-  if (is_fp8) {
+  if (is_quant) {
     TORCH_CHECK(isa_tag == cpu_attention::ISA::AMX ||
                     isa_tag == cpu_attention::ISA::VEC,
-                "FP8 KV cache is only supported on x86 (AMX/VEC) ISA");
+                "Quantized KV cache is only supported on x86 (AMX/VEC) ISA");
   }
 
   VLLM_DISPATCH_FLOATING_TYPES(
@@ -190,15 +199,21 @@ void cpu_attention_with_kv_cache(
   TORCH_CHECK_EQ(value_cache.dim(), 4);
 
   const int64_t kv_cache_idx =
-      static_cast<int64_t>(parse_fp8_kv_dtype(kv_cache_dtype));
-  const bool is_fp8 = (kv_cache_idx != 0);
-  if (is_fp8) {
-    TORCH_CHECK(key_cache.scalar_type() == at::ScalarType::Byte,
-                "key_cache must be uint8 for FP8 path");
-    TORCH_CHECK(value_cache.scalar_type() == at::ScalarType::Byte,
-                "value_cache must be uint8 for FP8 path");
-    TORCH_CHECK(k_scale > 0, "k_scale must be positive for FP8 path");
-    TORCH_CHECK(v_scale > 0, "v_scale must be positive for FP8 path");
+      static_cast<int64_t>(parse_quant_kv_dtype(kv_cache_dtype));
+  // is_quant covers fp8 and int8; is_int8 picks the int8 storage type.
+  const bool is_quant = (kv_cache_idx != 0);
+  const bool is_int8 =
+      kv_cache_idx ==
+      static_cast<int64_t>(cpu_attention::QuantKVCacheDataType::kInt8);
+  if (is_quant) {
+    const auto expected_dtype =
+        is_int8 ? at::ScalarType::Char : at::ScalarType::Byte;
+    TORCH_CHECK(key_cache.scalar_type() == expected_dtype,
+                "quantized KV cache: key_cache has unexpected scalar type");
+    TORCH_CHECK(value_cache.scalar_type() == expected_dtype,
+                "quantized KV cache: value_cache has unexpected scalar type");
+    TORCH_CHECK(k_scale > 0, "k_scale must be positive for quantized KV cache");
+    TORCH_CHECK(v_scale > 0, "v_scale must be positive for quantized KV cache");
   }
 
   cpu_attention::AttentionInput input;
@@ -230,12 +245,12 @@ void cpu_attention_with_kv_cache(
   input.sliding_window_size = sliding_window;
   input.softcap = static_cast<float>(softcap);
 
-  if (is_fp8) {
+  if (is_quant) {
     input.k_scale_fp8 = static_cast<float>(k_scale);
     input.v_scale_fp8 = static_cast<float>(v_scale);
     TORCH_CHECK(input.metadata->isa == cpu_attention::ISA::AMX ||
                     input.metadata->isa == cpu_attention::ISA::VEC,
-                "FP8 KV cache is only supported on x86 (AMX/VEC) ISA");
+                "Quantized KV cache is only supported on x86 (AMX/VEC) ISA");
   }
 
   VLLM_DISPATCH_FLOATING_TYPES(

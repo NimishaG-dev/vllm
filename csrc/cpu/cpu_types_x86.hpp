@@ -547,6 +547,13 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
       : reg(_mm512_cvt_roundepi32_ps(
             v.reg, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)) {}
 
+  // int8 KV cache: load 16 signed int8 and convert to fp32.
+  // Sign-extend int8 -> int32 -> fp32 (exact for the [-127, 127] range; the
+  // per-tensor dequant scale is folded into the softmax/output scales).
+  explicit FP32Vec16(const int8_t* ptr)
+      : reg(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr))))) {}
+
   FP32Vec16 operator*(const FP32Vec16& b) const {
     return FP32Vec16(_mm512_mul_ps(reg, b.reg));
   }

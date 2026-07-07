@@ -44,6 +44,12 @@ SEQ_LENS = [  # (q_len, kv_len)
 ]
 _FP8_ATOL = {"fp8_e4m3": 0.2, "fp8_e5m2": 0.3}
 _FP8_RTOL = 0.1
+# Per-tensor int8 KV cache. Uniform 8-bit quant over the calibrated [-1, 1]
+# range (step ~1/127) is comparable to fp8_e4m3 here, so reuse fp8_e4m3-like
+# tolerances. Validated: all 324 vec cases (bf16/fp16/fp32) pass at these
+# bounds against the exact float-KV reference.
+_INT8_ATOL = 0.2
+_INT8_RTOL = 0.1
 ENCODER_SEQ_LENS = [
     [1, 678, 2367, 145, 4162, 36, 7812],
 ]
@@ -453,9 +459,10 @@ def varlen_with_paged_kv(
         15 * torch.rand((num_query_heads,), dtype=torch.bfloat16) if use_sink else None
     )
 
-    is_fp8 = kv_cache_dtype != "auto"
-    if is_fp8 and current_platform.get_cpu_architecture() != CpuArchEnum.X86:
-        pytest.skip("FP8 KV cache only supported on x86")
+    is_quant = kv_cache_dtype != "auto"
+    is_int8 = kv_cache_dtype == "int8"
+    if is_quant and current_platform.get_cpu_architecture() != CpuArchEnum.X86:
+        pytest.skip("Quantized KV cache only supported on x86")
 
     query = tensor_cache(
         elem_num=token_num * num_query_heads * head_size,
@@ -478,15 +485,27 @@ def varlen_with_paged_kv(
         num_kv_heads,
         head_size,
     )
-    if is_fp8:
-        # Clamp KV to [-1, 1] so FP8 quantization error (<=12.5% for E4M3,
-        # <=25% for E5M2) stays within the test tolerances regardless of
-        # which tensor_cache values happen to be in use.
+    if is_quant:
+        # Clamp KV to [-1, 1] so quantization error (fp8: <=12.5% E4M3 /
+        # <=25% E5M2; int8: uniform step ~1/127) stays within the test
+        # tolerances regardless of which tensor_cache values are in use.
         key_value = key_value.clamp(-1, 1)
     key_cache, value_cache = key_value.unbind(0)
 
-    # KV cache for CPU attention
-    cache_dtype = torch.uint8 if is_fp8 else dtype
+    if is_int8:
+        # Per-tensor int8 needs a scalar scale that spans the int8 range,
+        # mirroring Attention.calc_kv_scales (|max| / 127). A too-small scale
+        # (e.g. the fp8 default of 1.0) would saturate every value at +/-127.
+        k_scale = (key_cache.abs().max() / 127.0).item()
+        v_scale = (value_cache.abs().max() / 127.0).item()
+
+    # KV cache for CPU attention. int8 uses signed int8 storage; fp8 uses uint8.
+    if is_int8:
+        cache_dtype = torch.int8
+    elif is_quant:
+        cache_dtype = torch.uint8
+    else:
+        cache_dtype = dtype
     packed_key_value_cache = torch.empty(
         num_blocks, num_kv_heads, block_size, head_size * 2, dtype=cache_dtype
     )
@@ -506,9 +525,9 @@ def varlen_with_paged_kv(
 
     # use reshape_and_cache to pack key_cache and value_cache
     slot_mapping = torch.arange(0, num_blocks * block_size, dtype=torch.int64)
-    fp8_kwargs: dict = (
+    quant_kwargs: dict = (
         dict(k_scale=k_scale, v_scale=v_scale, kv_cache_dtype=kv_cache_dtype)
-        if is_fp8
+        if is_quant
         else {}
     )
     cpu_attn_reshape_and_cache(
@@ -518,7 +537,7 @@ def varlen_with_paged_kv(
         value_cache=packed_value_cache,
         slot_mapping=slot_mapping,
         isa=isa,
-        **fp8_kwargs,
+        **quant_kwargs,
     )
 
     metadata = cpu_attn_get_scheduler_metadata(
@@ -553,7 +572,7 @@ def varlen_with_paged_kv(
         scheduler_metadata=metadata,
         s_aux=s_aux,
         dynamic_causal=dynamic_causal_tensor,
-        **fp8_kwargs,
+        **quant_kwargs,
     )
 
     metadata = cpu_attn_get_scheduler_metadata(
@@ -588,12 +607,12 @@ def varlen_with_paged_kv(
         scheduler_metadata=metadata,
         s_aux=s_aux,
         dynamic_causal=dynamic_causal_tensor,
-        **fp8_kwargs,
+        **quant_kwargs,
     )
 
-    if is_fp8:
-        # Build a float KV cache via the non-FP8 path and run float attention
-        # to use as the reference.
+    if is_quant:
+        # Build a float KV cache via the non-quantized path and run float
+        # attention to use as the reference.
         ref_key_cache = torch.empty(
             num_blocks, num_kv_heads, block_size, head_size, dtype=dtype
         )
@@ -624,8 +643,12 @@ def varlen_with_paged_kv(
             s_aux=s_aux,
             dynamic_causal=dynamic_causal_tensor,
         )
-        atol = _FP8_ATOL[kv_cache_dtype]
-        rtol = _FP8_RTOL
+        if is_int8:
+            atol = _INT8_ATOL
+            rtol = _INT8_RTOL
+        else:
+            atol = _FP8_ATOL[kv_cache_dtype]
+            rtol = _FP8_RTOL
     else:
         ref_output = ref_paged_attn(
             query=query,
@@ -731,6 +754,50 @@ def test_varlen_encoder_attention_amx(
 @pytest.mark.parametrize("use_sink", [False])
 @pytest.mark.parametrize("isa", ["vec"])
 def test_varlen_with_paged_kv_normal_vec(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    sliding_window: int | None,
+    dtype: torch.dtype,
+    block_size: int,
+    soft_cap: float | None,
+    num_blocks: int,
+    use_alibi: bool,
+    use_sink: bool,
+    isa: str,
+    kv_cache_dtype: str,
+) -> None:
+    varlen_with_paged_kv(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        head_size=head_size,
+        sliding_window=sliding_window,
+        dtype=dtype,
+        block_size=block_size,
+        soft_cap=soft_cap,
+        num_blocks=num_blocks,
+        use_alibi=use_alibi,
+        use_sink=use_sink,
+        isa=isa,
+        kv_cache_dtype=kv_cache_dtype,
+    )
+
+
+# Per-tensor int8 KV cache is implemented on the VEC (AVX-512) path only, so it
+# is tested on the "vec" ISA (no AMX variant yet). Mirrors the fp8 vec test.
+@pytest.mark.parametrize("kv_cache_dtype", ["int8"])
+@pytest.mark.parametrize("seq_lens", SEQ_LENS)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("block_size", [96, 128])
+@pytest.mark.parametrize("sliding_window", SLIDING_WINDOWS)
+@pytest.mark.parametrize("dtype", QTYPES)
+@pytest.mark.parametrize("soft_cap", [None])
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+@pytest.mark.parametrize("use_alibi", [False])
+@pytest.mark.parametrize("use_sink", [False])
+@pytest.mark.parametrize("isa", ["vec"])
+def test_varlen_with_paged_kv_int8_vec(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
     head_size: int,

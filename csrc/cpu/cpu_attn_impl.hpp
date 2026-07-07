@@ -14,11 +14,14 @@
 namespace cpu_attention {
 enum class ISA { AMX, VEC, VEC16, NEON, VXE, RVV, VSX };
 
-// Mirrors csrc/attention/dtype_fp8.cuh Fp8KVCacheDataType exactly.
-enum class Fp8KVCacheDataType {
+// Quantized KV cache dispatch key for CPU attention. Values 0-2 match
+// csrc/attention/dtype_fp8.cuh Fp8KVCacheDataType (kAuto/kFp8E4M3/kFp8E5M2);
+// kInt8 (3) is a CPU-only extension for per-tensor int8 KV cache.
+enum class QuantKVCacheDataType {
   kAuto = 0,
   kFp8E4M3 = 1,
   kFp8E5M2 = 2,
+  kInt8 = 3,
 };
 
 struct AttentionInput;
@@ -1478,10 +1481,13 @@ class AttentionMainLoop {
       }
 
       attention_impl_t attn_impl;
-      constexpr bool fp8_kv = std::is_same_v<kv_cache_t, c10::Float8_e4m3fn> ||
-                              std::is_same_v<kv_cache_t, c10::Float8_e5m2>;
+      // include int8 so per-tensor int8 KV cache also pulls k/v
+      // scales from the input and applies the output v-scale.
+      constexpr bool quant_kv = std::is_same_v<kv_cache_t, c10::Float8_e4m3fn> ||
+                                std::is_same_v<kv_cache_t, c10::Float8_e5m2> ||
+                                std::is_same_v<kv_cache_t, int8_t>;
       float output_v_scale = 1.0f;
-      if constexpr (fp8_kv) {
+      if constexpr (quant_kv) {
         attn_impl.init_from_input(input);
         output_v_scale = attn_impl.get_output_v_scale();
       }

@@ -25,6 +25,11 @@ FORCE_INLINE std::pair<vec_op::FP32Vec16, vec_op::FP32Vec16> load_b_pair_vec(
     vec_op::BF16Vec32 bf16_b_reg(reinterpret_cast<const uint8_t*>(ptr),
                                  vec_op::fp8_e5m2_tag{});
     return {vec_op::FP32Vec16(bf16_b_reg, 0), vec_op::FP32Vec16(bf16_b_reg, 1)};
+  } else if constexpr (std::is_same_v<kv_cache_t, int8_t>) {
+    // int8 KV cache: sign-extend int8 -> fp32 (32 elems as two
+    // FP32Vec16). The per-tensor dequant scale is folded into the softmax
+    // (K) and output (V) scales, so no per-element multiply here.
+    return {vec_op::FP32Vec16(ptr), vec_op::FP32Vec16(ptr + 16)};
   } else {
     using load_vec_t = typename VecTypeTrait<kv_cache_t>::vec_t;
     return std::make_pair(vec_op::FP32Vec16(load_vec_t(ptr)),
@@ -138,6 +143,10 @@ class AttentionImpl<ISA::VEC, scalar_t, head_dim, kv_cache_scalar_t> {
   static constexpr bool fp8_kv =
       std::is_same_v<kv_cache_scalar_t, c10::Float8_e4m3fn> ||
       std::is_same_v<kv_cache_scalar_t, c10::Float8_e5m2>;
+  // per-tensor int8 KV cache (signed int8 storage).
+  static constexpr bool int8_kv = std::is_same_v<kv_cache_scalar_t, int8_t>;
+  // Any quantized KV cache (fp8 or int8): both fold a scalar k/v scale.
+  static constexpr bool quant_kv = fp8_kv || int8_kv;
 
  public:
   using query_t = scalar_t;
@@ -154,21 +163,26 @@ class AttentionImpl<ISA::VEC, scalar_t, head_dim, kv_cache_scalar_t> {
   constexpr static int64_t MaxQHeadNumPerIteration = 8;
   constexpr static int64_t HeadDim = head_dim;
   constexpr static ISA ISAType = ISA::VEC;
-  constexpr static bool scale_on_logits = fp8_kv;
+  // int8 also folds its scalar scale onto the logits/output.
+  constexpr static bool scale_on_logits = quant_kv;
 
   float k_scale = 1.0f;
   float v_scale = 1.0f;
 
  public:
   void init_from_input(const AttentionInput* input) {
-    if constexpr (fp8_kv) {
+    if constexpr (quant_kv) {
       k_scale = input->k_scale_fp8;
       v_scale = input->v_scale_fp8;
     }
   }
 
   float get_output_v_scale() const noexcept {
-    if constexpr (fp8_kv) {
+    if constexpr (int8_kv) {
+      // int8 -> fp32 conversion is exact, so no 2^bias correction;
+      // the dequant is just the per-tensor v_scale.
+      return v_scale;
+    } else if constexpr (fp8_kv) {
       // VEC dequant unpacks FP8 into a pseudo-FP16 layout (exponent bias 15).
       // E4M3 (bias=7) needs correction 2^(15-7) = 2^8; E5M2 bias matches FP16
       // so no correction.
@@ -183,7 +197,10 @@ class AttentionImpl<ISA::VEC, scalar_t, head_dim, kv_cache_scalar_t> {
 
   template <template <typename tile_gemm_t> typename attention>
   FORCE_INLINE void execute_attention(DEFINE_CPU_ATTENTION_PARAMS) {
-    if constexpr (fp8_kv) {
+    if constexpr (int8_kv) {
+      // exact int8->fp32; fold only the per-tensor k_scale.
+      scale *= k_scale;
+    } else if constexpr (fp8_kv) {
       // Same bias correction as get_output_v_scale: VEC FP8→pseudo-FP16 dequant
       // uses bias 15; E4M3 (bias=7) needs ×2^8, E5M2 (bias=15) needs no
       // correction.
@@ -231,7 +248,9 @@ class AttentionImpl<ISA::VEC, scalar_t, head_dim, kv_cache_scalar_t> {
     constexpr int32_t unroll_size = head_dim / 16;
     using load_vec_t = typename VecTypeTrait<scalar_t>::vec_t;
 
-    const float effective_scale = fp8_kv ? 1.0f : scale;
+    // quant_kv (fp8 or int8) folds the scale onto the logits, so Q
+    // must stay unscaled here to avoid applying the scale twice.
+    const float effective_scale = quant_kv ? 1.0f : scale;
     vec_op::FP32Vec16 scale_vec(effective_scale);
     for (int32_t q_num_idx = 0; q_num_idx < q_num; ++q_num_idx) {
       for (int32_t q_head_idx = 0; q_head_idx < q_heads_per_kv; ++q_head_idx) {
@@ -267,7 +286,21 @@ class AttentionImpl<ISA::VEC, scalar_t, head_dim, kv_cache_scalar_t> {
       const float k_inv = 0.0f, const float v_inv = 0.0f) {
     if constexpr (fp8_kv) {
       constexpr auto qfn = select_fp8_quant_fn<kv_cache_t>();
-      reshape_and_cache_fp8_vec_impl<scalar_t, qfn>(
+      reshape_and_cache_quant_vec_impl<scalar_t, qfn>(
+          key, value, reinterpret_cast<uint8_t*>(key_cache),
+          reinterpret_cast<uint8_t*>(value_cache), slot_mapping, token_num,
+          head_num, head_dim, block_size, key_token_num_stride,
+          key_head_num_stride, value_token_num_stride, value_head_num_stride,
+          num_blocks_stride, cache_head_num_stride, num_blocks_stride,
+          cache_head_num_stride, k_inv, v_inv);
+      return;
+    }
+
+    if constexpr (int8_kv) {
+      // per-tensor int8 write: same byte column/row-major layout as
+      // fp8, but with the int8 quant function. The int8 cache buffer is
+      // reinterpreted to uint8 for the byte stores.
+      reshape_and_cache_quant_vec_impl<scalar_t, float_to_int8_scalar>(
           key, value, reinterpret_cast<uint8_t*>(key_cache),
           reinterpret_cast<uint8_t*>(value_cache), slot_mapping, token_num,
           head_num, head_dim, block_size, key_token_num_stride,

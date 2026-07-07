@@ -49,6 +49,8 @@ class CPUAttentionBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
+        # per-tensor int8 KV cache on CPU (real kernel quant/dequant).
+        "int8",
     ]
 
     @staticmethod
@@ -481,6 +483,11 @@ def _get_attn_isa(
         raise NotImplementedError(
             "FP8 KV cache on CPU requires x86 with AVX-512 or AMX."
         )
+    # per-tensor int8 KV cache is implemented on the VEC (AVX-512)
+    # read/write path only for now, so route it to "vec" (skip AMX). AMX always
+    # implies AVX-512 on x86, so vec is available wherever amx would have been.
+    if kv_cache_dtype == "int8":
+        return "vec"
     if supports_amx and dtype in (torch.bfloat16,) and block_size % 32 == 0:
         return "amx"
     elif block_size % 32 == 0:

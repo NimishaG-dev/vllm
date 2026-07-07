@@ -25,10 +25,12 @@ ISA_TYPES = {
 }
 
 # KV cache index: 0 = auto (same as scalar_t), 1 = fp8_e4m3, 2 = fp8_e5m2
+# 3 = int8 (per-tensor int8 KV cache, must match QuantKVCacheDataType).
 KV_CACHE_IDX = {
     "auto": 0,
     "fp8_e4m3": 1,
     "fp8_e5m2": 2,
+    "int8": 3,
 }
 
 # C++ type for each kv_cache index
@@ -36,6 +38,8 @@ KV_CACHE_CPP_TYPES = {
     "auto": "scalar_t",
     "fp8_e4m3": "c10::Float8_e4m3fn",
     "fp8_e5m2": "c10::Float8_e5m2",
+    # per-tensor int8 KV cache.
+    "int8": "int8_t",
 }
 
 # ISAs supported for head_dims divisible by 32
@@ -46,6 +50,10 @@ ISA_FOR_16 = ["VEC16"]
 
 # ISAs that support FP8 KV cache (x86 AVX2/AVX-512 required)
 ISA_FOR_FP8 = ["AMX", "VEC"]
+
+# ISAs that support per-tensor int8 KV cache. VEC (AVX-512) only for
+# now; AMX int8 is a follow-up.
+ISA_FOR_INT8 = ["VEC"]
 
 
 def encode_params(head_dim: int, isa_type: str, kv_cache: str = "auto") -> int:
@@ -114,6 +122,15 @@ def generate_cases_for_isa_group(isa_list: list[str], include_fp8: bool = False)
                         continue
                     cases.append(_make_case(head_dim, isa, fp8_type))
 
+    # INT8 cases: VEC only, head_dims divisible by 32. Gated on the
+    # same `include_fp8` flag (the AVX-512-capable macro blocks).
+    if include_fp8:
+        for head_dim in HEAD_DIMS_32:
+            for isa in isa_list:
+                if isa not in ISA_FOR_INT8:
+                    continue
+                cases.append(_make_case(head_dim, isa, "int8"))
+
     return "\n".join(cases)
 
 
@@ -168,7 +185,7 @@ def generate_header_file() -> str:
     # Generate dispatch macro with conditional compilation for different ISA sets
     header += """
 // Dispatch macro using encoded parameters.
-// KV_CACHE_IDX: Fp8KVCacheDataType enum value (kAuto=0, kFp8E4M3=1, kFp8E5M2=2).
+// KV_CACHE_IDX: QuantKVCacheDataType enum value (kAuto=0, kFp8E4M3=1, kFp8E5M2=2).
 // FP8 cases (kv_cache_idx != 0) are generated on x86 platforms with AVX2 or
 // AVX-512: BF16Vec32 FP8 constructors have both AVX-512 and AVX2 implementations
 // in cpu_types_x86.hpp. Non-x86 platforms (#else fallback) have fp8=False.
